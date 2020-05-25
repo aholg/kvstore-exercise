@@ -38,15 +38,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Persistence._
   import context.dispatcher
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
-
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
+
+  var seqNumber = 0L
 
 
   def receive = {
@@ -54,22 +52,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) =>
       kv += (key -> value)
       sender ! OperationAck(id)
     case Get(key, id) =>
-      val maybeValue= kv.get(key)
+      val maybeValue = kv.get(key)
       sender ! GetResult(key, maybeValue, id)
-    case Remove(key, id) => kv =
-      kv.removed(key)
+    case Remove(key, id) =>
+      kv = kv.removed(key)
       sender ! OperationAck(id)
   }
 
-  /* TODO Behavior for the replica role. */
   val replica: Receive = {
-    case _ =>
+    case Get(key, id) =>
+      val maybeValue = kv.get(key)
+      sender ! GetResult(key, maybeValue, id)
+    case Snapshot(key, maybeValue, seq) if seq == seqNumber =>
+      maybeValue match {
+        case Some(value) => kv = kv.updated(key, value)
+        case None => kv = kv.removed(key)
+      }
+      seqNumber += 1L
+      sender ! SnapshotAck(key, seq)
+    case Snapshot(key, _, seq) if seq < seqNumber =>
+      sender ! SnapshotAck(key, seq)
+
   }
 
   arbiter ! Join
