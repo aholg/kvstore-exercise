@@ -43,7 +43,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
-  var pendingPersistances = Map.empty[Long, (ActorRef, Persist)]
+  var pendingPersistances = Map.empty[Long, PendingPersistance]
+
+  case class PendingPersistance(sender: ActorRef, persist: Persist, var retries: Int, persisted: Boolean, remainingReplicationAcks: Int)
 
   var seqNumber = 0L
   private val persistence: ActorRef = context.actorOf(persistenceProps)
@@ -52,8 +54,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     new Runnable {
       override def run(): Unit = {
         pendingPersistances.foreach { entry =>
-          val persistanceEntry = entry._2._2
-          persistence ! persistanceEntry
+          val persistanceEntry = entry._2
+
+          if (persistanceEntry.retries > 10) {
+            val seqNumber = entry._1
+            pendingPersistances = pendingPersistances.removed(seqNumber)
+            persistanceEntry.sender ! OperationFailed(seqNumber)
+          } else {
+            persistence ! persistanceEntry.persist
+            persistanceEntry.retries += 1
+          }
         }
       }
     }
@@ -67,13 +77,46 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   val leader: Receive = {
     case Insert(key, value, id) =>
       kv += (key -> value)
-      sender ! OperationAck(id)
+      val persist = Persist(key, Some(value), id)
+      pendingPersistances += (id -> PendingPersistance(sender, persist, 0, false, replicators.size))
+      persistence ! persist
+      replicators.foreach(_ ! Replicate(key, Some(value), id))
     case Get(key, id) =>
       val maybeValue = kv.get(key)
       sender ! GetResult(key, maybeValue, id)
     case Remove(key, id) =>
       kv = kv.removed(key)
       sender ! OperationAck(id)
+    case Persisted(_, id) =>
+      pendingPersistances = pendingPersistances.get(id) match {
+        case Some(persistanceEntry) =>
+          if (persistanceEntry.remainingReplicationAcks == 0) {
+            persistanceEntry.sender ! OperationAck(id)
+            pendingPersistances.removed(id)
+          } else {
+            val remainingAcks = persistanceEntry.remainingReplicationAcks
+            pendingPersistances.updated(id, persistanceEntry.copy(persisted = true))
+          }
+        case _ => pendingPersistances
+      }
+    case Replicas(replicas) =>
+      replicas.foreach(replica => {
+        val replicator = context.actorOf(Replicator.props(replica))
+        replicators += replicator
+        secondaries += (replica -> replicator)
+      })
+    case Replicated(_, seq) =>
+      pendingPersistances = pendingPersistances.get(seq) match {
+        case Some(persistanceEntry) =>
+          if (persistanceEntry.persisted == true && persistanceEntry.remainingReplicationAcks == 1) {
+            persistanceEntry.sender ! OperationAck(seq)
+            pendingPersistances.removed(seq)
+          } else {
+            val remainingAcks = persistanceEntry.remainingReplicationAcks
+            pendingPersistances.updated(seq, persistanceEntry.copy(remainingReplicationAcks = remainingAcks - 1))
+          }
+        case _ => pendingPersistances
+      }
   }
 
   val replica: Receive = {
@@ -86,8 +129,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         case None => kv = kv.removed(key)
       }
       val persist = Persist(key, maybeValue, seq)
-      pendingPersistances += (seq -> (sender, persist))
-
+      pendingPersistances += (seq -> PendingPersistance(sender, persist, 0, false, 0))
       persistence ! persist
     case Snapshot(key, _, seq) if seq < seqNumber =>
       sender ! SnapshotAck(key, seq)
@@ -95,7 +137,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       pendingPersistances = pendingPersistances.get(id) match {
         case Some(persistanceEntry) =>
           seqNumber += 1L
-          persistanceEntry._1 ! SnapshotAck(key, id)
+          persistanceEntry.sender ! SnapshotAck(key, id)
           pendingPersistances.removed(id)
         case _ => pendingPersistances
       }
