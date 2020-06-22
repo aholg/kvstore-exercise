@@ -1,10 +1,9 @@
 package kvstore
 
-import akka.actor.{OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated, ActorRef, Actor}
+import akka.actor.{Actor, ActorRef, Props}
 import kvstore.Arbiter._
-import akka.pattern.{ask, pipe}
+
 import scala.concurrent.duration._
-import akka.util.Timeout
 
 object Replica {
 
@@ -33,9 +32,9 @@ object Replica {
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
+  import Persistence._
   import Replica._
   import Replicator._
-  import Persistence._
   import context.dispatcher
 
   var kv = Map.empty[String, String]
@@ -58,7 +57,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
           if (persistanceEntry.retries > 10) {
             val seqNumber = entry._1
-            pendingPersistances = pendingPersistances.removed(seqNumber)
+            //            pendingPersistances = pendingPersistances.removed(seqNumber)
             persistanceEntry.sender ! OperationFailed(seqNumber)
           } else {
             persistence ! persistanceEntry.persist
@@ -78,9 +77,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Insert(key, value, id) =>
       kv += (key -> value)
       val persist = Persist(key, Some(value), id)
-      pendingPersistances += (id -> PendingPersistance(sender, persist, 0, false, replicators.size))
+      pendingPersistances += (id -> PendingPersistance(sender, persist, 0, false, secondaries.size))
       persistence ! persist
-      replicators.foreach(_ ! Replicate(key, Some(value), id))
+      secondaries.foreach(secondary  => secondary._2  ! Replicate(key, Some(value), id))
     case Get(key, id) =>
       val maybeValue = kv.get(key)
       sender ! GetResult(key, maybeValue, id)
@@ -94,16 +93,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             persistanceEntry.sender ! OperationAck(id)
             pendingPersistances.removed(id)
           } else {
-            val remainingAcks = persistanceEntry.remainingReplicationAcks
             pendingPersistances.updated(id, persistanceEntry.copy(persisted = true))
           }
-        case _ => pendingPersistances
+        case _ =>
+          pendingPersistances
       }
     case Replicas(replicas) =>
       replicas.foreach(replica => {
         val replicator = context.actorOf(Replicator.props(replica))
         replicators += replicator
-        secondaries += (replica -> replicator)
+        if (replica != this.context.self) {
+          secondaries += (replica -> replicator)
+        }
       })
     case Replicated(_, seq) =>
       pendingPersistances = pendingPersistances.get(seq) match {
