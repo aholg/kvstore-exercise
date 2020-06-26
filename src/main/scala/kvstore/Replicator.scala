@@ -1,9 +1,6 @@
 package kvstore
 
-import akka.actor.Props
-import akka.actor.Actor
-import akka.actor.ActorRef
-import scala.concurrent.duration._
+import akka.actor.{Actor, ActorRef, Props, Terminated}
 
 object Replicator {
 
@@ -64,5 +61,12 @@ class Replicator(val replica: ActorRef) extends Actor {
           acks.removed(seq)
         case _ => acks
       }
+  }
+
+  override def postStop(){
+    acks.foreach { ack =>
+      val replicateMsg = ack._2
+      replicateMsg._1 ! Replicated(replicateMsg._2.key, replicateMsg._2.id)
+    }
   }
 }

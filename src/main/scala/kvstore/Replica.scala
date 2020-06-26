@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Props}
+import akka.actor.{Actor, ActorRef, Props, Terminated}
 import kvstore.Arbiter._
 
 import scala.concurrent.duration._
@@ -79,12 +79,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       val persist = Persist(key, Some(value), id)
       pendingPersistances += (id -> PendingPersistance(sender, persist, 0, false, secondaries.size))
       persistence ! persist
-      secondaries.foreach(secondary  => secondary._2  ! Replicate(key, Some(value), id))
+      secondaries.foreach(secondary => secondary._2 ! Replicate(key, Some(value), id))
     case Get(key, id) =>
       val maybeValue = kv.get(key)
       sender ! GetResult(key, maybeValue, id)
     case Remove(key, id) =>
       kv = kv.removed(key)
+      secondaries.foreach(secondary => secondary._2 ! Replicate(key, None, id))
       sender ! OperationAck(id)
     case Persisted(_, id) =>
       pendingPersistances = pendingPersistances.get(id) match {
@@ -99,10 +100,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           pendingPersistances
       }
     case Replicas(replicas) =>
+      secondaries.filterNot{r =>
+        replicas.exists(_.path == r._1.path) == true}.foreach{r =>
+        context.stop(r._2)}
+      replicators = Set.empty
+      secondaries = Map.empty
       replicas.foreach(replica => {
         val replicator = context.actorOf(Replicator.props(replica))
         replicators += replicator
         if (replica != this.context.self) {
+          kv.zipWithIndex.foreach {
+            case (v, i) => replicator ! Replicate(v._1, Some(v._2), i)
+          }
           secondaries += (replica -> replicator)
         }
       })
