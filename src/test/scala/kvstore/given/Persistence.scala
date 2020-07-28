@@ -13,15 +13,16 @@ object Persistence {
 class Persistence(flaky: Boolean) extends Actor {
   import kvstore.Persistence._
 
-  private def newFailCount: Int = if (flaky) Random.nextInt(4) else 0
+  private def newFailCount: Int = if (true) Random.nextInt(1) else 0
   var failSteps: Int = newFailCount
 
   def receive = {
-    case Persist(key, value, id) =>
-      if (failSteps == 0) {
+    case p @ Persist(key, value, id) =>
+      if (failSteps <=0) {
         sender ! Persisted(key, id)
         failSteps = newFailCount
-      } else failSteps -= 1
+      } else
+        failSteps -= 1
   }
 
 }
